@@ -136,6 +136,100 @@ const querystring = require('querystring')
 const defaultTopFolder = topFolder || "."
 console.log("Top folder for file storage is: ", defaultTopFolder)
 
+// 12/02/25 new Backoff configuration for rate-limit (429) handling (exponential backoff with jitter)
+const backoffBaseMs = Number(process.env.backoffBaseMs || 30000); // base delay (ms), default 30s
+const backoffMaxMs = Number(process.env.backoffMaxMs || 180000); // cap (ms), default 3 minutes
+const backoffJitterRatio = Number(process.env.backoffJitterRatio || 0.2); // +/-20% jitter
+// 
+/* Helper function to compute exponential backoff delay with jitter using countdown attempts
+*/
+function computeBackoffDelayMs(initialAttempts, remainingAttempts) {
+  const attemptNumber = (initialAttempts - remainingAttempts) + 1; // 1..initialAttempts
+  const raw = Math.min(backoffBaseMs * Math.pow(2, attemptNumber - 1), backoffMaxMs);
+  const jitterSpan = Math.floor(raw * backoffJitterRatio);
+  const jitter = jitterSpan > 0 ? (Math.floor(Math.random() * (2 * jitterSpan + 1)) - jitterSpan) : 0; // [-span, +span]
+  return Math.max(0, raw + jitter);
+}
+
+// ----- Instrumentation Setup (useful for debugging rate limit errors during job polling) -----
+// 12/2/25 UNCOMMENT AFTER TESTING const POLL_DEBUG_ENABLED = (process.env.POLL_DEBUG || '').toLowerCase() === 'true';
+var POLL_DEBUG_ENABLED = true // 12/2/25 can be commented out after debugging/testing
+
+const pollMetrics = {
+  configLogged: false,
+  jobs: Object.create(null),
+  rateLimitEvents: 0,
+};
+
+function dbg(...args) {
+  if (POLL_DEBUG_ENABLED) {
+    const ts = new Date().toISOString();
+    console.log(ts, '[POLL]', ...args);
+  }
+}
+
+function logPollingConfig({ sleepMs, maxSimultaneousQueries }) {
+  if (!POLL_DEBUG_ENABLED || pollMetrics.configLogged) return;
+  pollMetrics.configLogged = true;
+  dbg(
+    `Init: sleepMs=${sleepMs} (ms), maxSimultaneousQueries=${maxSimultaneousQueries}, nodePid=${process.pid}`
+  );
+}
+
+function recordPollStart(jobId) {
+  if (!POLL_DEBUG_ENABLED) return;
+  const job = pollMetrics.jobs[jobId] || (pollMetrics.jobs[jobId] = {
+    polls: 0,
+    firstStart: Date.now(),
+    lastPollStart: null,
+    lastStatus: null,
+  });
+
+  const now = Date.now();
+  if (job.lastPollStart) {
+    const delta = now - job.lastPollStart;
+    dbg(`Job ${jobId} interval since previous poll: ${delta} ms`);
+  } else {
+    dbg(`Job ${jobId} first poll start`);
+  }
+  job.lastPollStart = now;
+}
+
+function recordPollEnd(jobId, status, startTime) {
+  if (!POLL_DEBUG_ENABLED) return;
+  const job = pollMetrics.jobs[jobId];
+  if (!job) return;
+
+  job.polls += 1;
+  job.lastStatus = status;
+  const duration = Date.now() - startTime;
+  dbg(`Job ${jobId} poll #${job.polls} status=${status} duration=${duration} ms`);
+}
+
+function recordRateLimit(jobId, attemptNumber, plannedDelayMs) {
+  pollMetrics.rateLimitEvents += 1;
+  dbg(
+    `Job ${jobId} RATE LIMIT (429) attempt=${attemptNumber}, waiting ${plannedDelayMs} ms ` +
+    `totalRateLimitEvents=${pollMetrics.rateLimitEvents}`
+  );
+}
+
+function logGlobalSummary() {
+  if (!POLL_DEBUG_ENABLED) return;
+  const totals = Object.values(pollMetrics.jobs).reduce(
+    (acc, j) => {
+      acc.jobs += 1;
+      acc.polls += j.polls;
+      return acc;
+    },
+    { jobs: 0, polls: 0 }
+  );
+  dbg(
+    `Global Summary: jobs=${totals.jobs}, totalPolls=${totals.polls}, rateLimitEvents=${pollMetrics.rateLimitEvents}`
+  );
+}
+// ----- Instrumentation Setup End) -----
+
 /** Returns an authentication token using authData as parameters to the request
  * 
  * <p> if 'complete' is true, then the function returns an object with format { access_token: blah, expires_at: blah }. 
@@ -255,52 +349,124 @@ const retrieveTable = async (table, format, authResponse, filter, since, until) 
 }
 
 /** Monitors a job which has already started running given its Id and an authentication token
- * 
+ *  <p> Updated 11/25/25 to use pollJobWithRetrials which handles rate limit errors with retrials and backoff</p>
  */
 const monitorJob = async (jobId, authResponse) => {
-	//authResponse = ensureValidToken(authResponse)
-	//let jwt = authResponse.access_token ? authResponse.access_token : authResponse
+	// ensure configuration logged once
+	logPollingConfig({ sleepMs, maxSimultaneousQueries });
 	let jwt
 	let authHeaders
-	let pollJobEndpoint = pollJobEndpointBase + jobId
-	//let authHeaders = { "Authorization": "Bearer " + jwt } 
+	// 11/25/25 (now set within pollJobwithRetrials) let pollJobEndpoint = pollJobEndpointBase + jobId
 	//console.log("Monitoring job: ", jobId)
 	let jobStatus = "running"
 	let result = undefined
+	//let suspend = false
+	
 	while (jobStatus === "running" || jobStatus === "waiting") {
-		if (authResponse) {
-			authResponse = await ensureValidToken(authResponse)
-		} else {
-			authResponse = await ensureValidToken(currentlyValidToken)
-		}
-		if (authResponse) {
-			//console.log("Polling job: ", jobId)
-			jwt = authResponse.access_token ? authResponse.access_token : authResponse
-			authHeaders = { "x-instauth": jwt } 
-			try {
-				let response = await axios( { method: 'GET', url: pollJobEndpoint, headers: authHeaders})
-				if (response && response.data) {
-					jobStatus = response.data.status
-					if (jobStatus !== "running" && jobStatus !== "waiting") {
-						console.log("Job: " + jobId + "has either completed or failed: ", 
-								response.data)
-						result = response.data
-						break;
-					} else {
-						console.log("Job: " + jobId + " is still " + jobStatus + "...")
-						await delay(sleepMs)
-					}
-				}
-			} catch(error) {
-				console.log("Oops! Job may have failed!:", jobId)
-				console.log("Obtained error from Axios when polling job status: ", error)
-				console.error(error, error.stack)
-				throw error
+		let delayReturn = await delay(sleepMs)
+		if (delayReturn === true) {
+			//console.log("Beginning of monitoring iteration for job: ", jobId)
+			if (authResponse ) {
+				authResponse = await ensureValidToken(authResponse)
+			} else {
+				authResponse = await ensureValidToken(currentlyValidToken)
 			}
+			
+			if (authResponse ) {
+				// await delay(sleepSeconds)
+				// console.log("Polling job: ", jobId)
+				jwt = authResponse.access_token ? authResponse.access_token : authResponse;
+				//12/20/22 authHeaders = { "Authorization": "Bearer " + jwt } 
+				authHeaders = { "x-instauth": jwt } ;
+				try {
+					// 11/25/25 let response = await axios( { method: 'GET', url: pollJobEndpoint, headers: authHeaders})
+					let response = await pollJobWithRetrials(jobId, authHeaders, 3); // 3 retrials for rate limit errors
+					if (response && response.data) {
+						jobStatus = response.data.status;
+						
+						if (jobStatus !== "running" && jobStatus !== "waiting") {
+							// 11/25/25 console.log("Job: " + jobId + "has either completed or failed: ", response.data)
+							console.log("Job: " + jobId + "has ended with a status of: " + jobStatus);
+							result = response.data;
+							break;
+						} else {
+							console.log("Job: " + jobId + " is still " + jobStatus + "...");
+							//await delay(sleepMs);
+						}
+					}
+				
+				} catch(error) {
+					// 11/25/25 console.log("Oops! Job may have failed!:", jobId)
+					dbg(`Job ${jobId} poll error: ${error.message}`); // 12/2/25 instrumentation
+					// Preserve existing behavior
+					console.log("Obtained error from Axios when polling job " + jobId + " status: ", error)
+					console.error(error, error.stack)
+					throw error
+				}
+			}
+			//console.log("End of monitoring iteration for job: ", jobId)
 		}
 	}
 	return result
 }
+
+/* 12/2/25 Poll a job with retrials (accounts for rate limitation errors via an exponential backoff with jitter strategy)
+*/
+const pollJobWithRetrials = async (jobId, authHeaders, remainingAttempts, initialAttempts = remainingAttempts) => {
+  const pollStart = Date.now();
+  recordPollStart(jobId);
+
+  const pollJobEndpoint = pollJobEndpointBase + jobId;
+
+  try {
+    const response = await axios({
+      method: 'GET',
+      url: pollJobEndpoint,
+      headers: authHeaders
+    });
+
+    if (response && response.data) {
+      recordPollEnd(jobId, response.data.status, pollStart);
+      return response;
+    }
+
+  } catch (error) {
+    // Prefer axios error.response.status; fall back to message/stack text for Node 8
+    var status = (error && error.response && error.response.status) ? error.response.status : undefined;
+    var msgText = (error && error.message) ? String(error.message) : "";
+    var stackText = (error && error.stack) ? String(error.stack) : "";
+    var is429 = (status === 429) || (msgText.indexOf("429") >= 0) || (stackText.indexOf("429") >= 0);
+
+    if (is429 && remainingAttempts > 0) {
+      // Compute human-friendly attempt number and dynamic backoff
+      const attemptNumber = (initialAttempts - remainingAttempts) + 1;
+      const plannedDelayMs = computeBackoffDelayMs(initialAttempts, remainingAttempts);
+
+      console.log("Rate limitation error when polling job: " + jobId + " - will retry after a delay of " + plannedDelayMs + " ms...");
+      recordRateLimit(jobId, attemptNumber, plannedDelayMs);
+      if (await delay(plannedDelayMs)) {
+        return await pollJobWithRetrials(jobId, authHeaders, remainingAttempts - 1, initialAttempts);
+      }
+
+    } /* else if ((status === 500 || status === 502 || status === 503 || status === 504) && remainingAttempts > 0) {
+      // Optional: transient server errors get a shorter backoff using the same function but with reduced base via env if desired
+      const attemptNumber = (initialAttempts - remainingAttempts) + 1;
+      const plannedDelayMs = computeBackoffDelayMs(initialAttempts, remainingAttempts);
+      console.log("Transient server error (" + status + ") when polling job: " + jobId + " - will retry after " + plannedDelayMs + " ms...");
+      recordRateLimit(jobId, attemptNumber, plannedDelayMs);
+      await delay(plannedDelayMs);
+      return await pollJobWithRetrials(jobId, authHeaders, remainingAttempts - 1, initialAttempts);
+
+    } */ else {
+      console.log("Oops! Could NOT poll job after retrials!:", jobId);
+      console.log("Obtained error from Axios when polling job " + jobId, error);
+      console.error(error, error.stack);
+      dbg(`Job ${jobId} unrecoverable error msg=${msgText} status=${status}`);
+      throw error;
+    }
+  }
+};
+
 
 /** Retrieve data from URLs given within responseData, and with a given auth token
  * 
@@ -524,63 +690,7 @@ const retrieveTablesSchema = () => {
  * from the filename of the most recently retrieved table file, and uses it as the 'since' value for 
  * a new incremental retrieval job for that table. </p>
  */
-const retrieveIncrementalTableSubsetOLD = async(tablesList, folderName, until)=> {
-	console.log("Will try to retrieve incremental updates for the following tables... ", tablesList)
-	let table
-	let errored
-	let retrieved
-	let promises = []
-	// TODO: if until is undefined, consider setting up a reasonable time for it here
-	try {
-		for (let i=0; i < tablesList.length; i++) {
-			table = tablesList[i]
-			// find most recent file representing an update to this table
-			let recentUpdate = await findLastTableUpdate(table, folderName)
-			// parse file name to obtain tokens, including the timestamp of the latest table update
-			if (recentUpdate) {
-				let fileParts = parseFileName(recentUpdate)
-				let since = undefined
-				if (fileParts.at) {
-					let timestamp = fileParts.at
-					let timeparts = timestamp.split("T")
-					if (timeparts.length === 2) {
-						let date = timeparts[0]
-						let time = timeparts[1]
-						since = date + "T" + time.replace("-",":")
-					}
-				}
-				promises.push(retrieveCompleteTable(table, since, until, folderName))
-			} else {// this table needs to be retrieved for the first time --> use a snapshot
-				promises.push(retrieveCompleteTable(table, undefined, until, folderName))
-			}
-		}
-	} catch (error) {
-		console.log("Uncaught top level Error while finding the most updated file for table: " + table + 
-				"- terminating incremental script!: ", error)
-		console.error(error, error.stack)
-	}
-	try {
-		let responses = await Promise.all(promises)
-		if (responses) {
-			
-			console.log("Looks like I've finished retrieving all the tables in the input set!")
-			let errors = responses.filter(response => response && response.error && response.table)
-			if (errors && errors.length > 0) {
-				console.log(errors.length + " errors have occurred during table retrieval as follows: ", errors )
-			} else {
-				console.log("Yay! all retrievals were successful for all tables in the set!")
-			}
-			errored = errors.map(errorResponse => errorResponse.table)
-			retrieved = tablesList.filter(tableName => 
-				!(errored && errored.length > 0 && errored.includes(tableName)))
-			console.log("The following tables were successfully retrieved: ", retrieved)
-		}
-	} catch(error) {
-		// NOTE: this should never happen, as each retrieval does NOT throw exceptions
-		console.log("Uncaught top level Error - terminating incremental script!: ", error)
-		console.error(error, error.stack)
-	}
-}
+
 
 const partitionArrayIntoGroups = (inputArray, maxElements) => {
 	let result = []
@@ -601,8 +711,11 @@ const partitionArrayIntoGroups = (inputArray, maxElements) => {
 	return result
 }
 
-/** Retrieves (incrementally) a subset of tables given by an array of table names
+/** Retrieves (incrementally) a subset of tables given by an array of table names, working on 'maxSimultaneousQueries' tables at a time. 
  * 
+ * <p> For each table, it figures out the last update time for that table -that is, 'current as of time'- 
+ * from the filename of the most recently retrieved table file, and uses it as the 'since' value for 
+ * a new incremental retrieval job for that table. </p>
  */
 const retrieveIncrementalTableSubset = async(tablesList, folderName, until)=> {
 	console.log("Starting incremental retrievals onto folder: " + folderName + " for the following tables... ", tablesList)
@@ -684,7 +797,8 @@ const retrieveIncrementalTableSubset = async(tablesList, folderName, until)=> {
 	}
 	console.log("Incremental table subset retrieval has ended!")
 	console.log("The following tables in this set were successfully retrieved: ", allSuccessfulRetrievals)
-	console.log(allFailedRetrievals.length + " errors have occurred as follows: ", allFailedRetrievals )
+	console.log(allFailedRetrievals.length + " tables in this set were NOT successfully retrieved: ", allFailedRetrievals ) // 12/8/25 
+	logGlobalSummary() // 12/2/25 log global summary of polling activities (instrumentation)
 }
 
 /** Creates an ISO formatted version of the given date in string form, sanitized to avoid colons and periods
