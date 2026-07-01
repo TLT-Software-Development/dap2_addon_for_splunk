@@ -1,1 +1,9 @@
 /.DS_Store
+
+# Environment files with credentials
+.env
+bin/DAP-nodescripts-beta-main/.env
+
+# Keep the example file
+!.env.example
+!bin/DAP-nodescripts-beta-main/.env.example
